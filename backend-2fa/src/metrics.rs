@@ -50,6 +50,8 @@ pub struct Metrics {
     pub webhook_delivery_total: CounterVec,
     /// Total webhook delivery retries (one per retry, not per initial attempt).
     pub webhook_delivery_retries_total: prometheus::Counter,
+    /// Total Redis connection pool exhaustion events (fail-open).
+    pub redis_pool_exhaustion_total: prometheus::Counter,
     /// Dedicated Prometheus registry. All metrics in this struct are registered
     /// here, never in the global default registry.
     pub(crate) registry: Registry,
@@ -181,6 +183,16 @@ pub fn metrics() -> &'static Metrics {
             "webhook_delivery_retries_total",
         );
 
+        let redis_pool_exhaustion_total = try_register(
+            &registry,
+            prometheus::Counter::new(
+                "redis_pool_exhaustion_total",
+                "Total times Redis connection pool was exhausted (fail-open rate limit)",
+            )
+            .expect("valid metric name"),
+            "redis_pool_exhaustion_total",
+        );
+
         Metrics {
             build_info,
             totp_verifications_total,
@@ -193,6 +205,7 @@ pub fn metrics() -> &'static Metrics {
             leaderboard_ws_connections_total,
             webhook_delivery_total,
             webhook_delivery_retries_total,
+            redis_pool_exhaustion_total,
             registry,
         }
     })
@@ -233,6 +246,11 @@ pub fn record_rate_limit_hit(endpoint: &str, reason: &str) {
 /// Record a Redis-unavailable fallback in DistributedRateLimiter.
 pub fn record_redis_fallback() {
     metrics().rate_limiter_redis_fallback_total.inc();
+}
+
+/// Record a Redis connection pool exhaustion event (fail-open).
+pub fn record_redis_pool_exhaustion() {
+    metrics().redis_pool_exhaustion_total.inc();
 }
 
 /// Update DB pool gauges.

@@ -66,11 +66,23 @@ pub trait RateLimiter: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Window size and request limit for a single endpoint.
+///
+/// # Fail-open on pool exhaustion
+///
+/// When the Redis connection pool is exhausted (i.e. a connection cannot be
+/// obtained within `connection_timeout_ms`), the rate limiter **fails open**
+/// and returns [`RateLimitResult::Allowed`] with a warning log, rather than
+/// blocking the request. This ensures that a Redis outage does not lock
+/// legitimate users out of the system. The `redis_pool_exhaustion_total`
+/// counter metric is incremented on each such event.
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub window_secs: u64,
     pub max_failures: u32,
     pub lockout_secs: u64,
+    /// Maximum time (ms) to wait for a Redis connection from the pool.
+    /// When the timeout is reached, the limiter fails open.
+    pub connection_timeout_ms: u64,
 }
 
 impl EndpointConfig {
@@ -87,7 +99,14 @@ impl EndpointConfig {
             window_secs,
             max_failures,
             lockout_secs,
+            connection_timeout_ms: 2_000, // default 2 second timeout
         }
+    }
+
+    /// Set the Redis connection timeout (milliseconds).
+    pub fn with_connection_timeout(mut self, ms: u64) -> Self {
+        self.connection_timeout_ms = ms;
+        self
     }
 }
 
@@ -233,25 +252,39 @@ impl<B: RedisBackend> RedisTwoFactorFailureCounter<B> {
 
 pub struct LiveRedisBackend {
     client: redis::Client,
+    /// Timeout for acquiring a Redis connection from the pool.
+    pool_timeout: std::time::Duration,
 }
 
 impl LiveRedisBackend {
     pub fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
         Ok(Self {
             client: redis::Client::open(redis_url)?,
+            pool_timeout: std::time::Duration::from_secs(2),
         })
     }
 
-    fn get_connection(&self) -> redis::RedisResult<redis::Connection> {
-        self.client.get_connection()
+    fn try_get_connection(&self) -> Option<redis::Connection> {
+        match self.client.get_connection_with_timeout(self.pool_timeout) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    timeout_ms = %self.pool_timeout.as_millis(),
+                    "Redis connection pool exhausted; rate limiter failing open"
+                );
+                crate::metrics::record_redis_pool_exhaustion();
+                None
+            }
+        }
     }
 }
 
 impl RedisBackend for LiveRedisBackend {
     fn ttl(&self, key: &str) -> i64 {
-        let mut con = match self.get_connection() {
-            Ok(c) => c,
-            Err(_) => return -2,
+        let mut con = match self.try_get_connection() {
+            Some(c) => c,
+            None => return -2,
         };
         con.ttl(key).unwrap_or(-2)
     }
@@ -264,12 +297,9 @@ impl RedisBackend for LiveRedisBackend {
         member: &str,
         ttl_secs: u64,
     ) -> u64 {
-        let mut con = match self.client.get_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(key = key, error = %e, "[LiveRedisBackend] connection error");
-                return 0;
-            }
+        let mut con = match self.try_get_connection() {
+            Some(c) => c,
+            None => return 0,
         };
         let result: redis::RedisResult<(u64,)> = (|| {
             let mut pipe = redis::pipe();
@@ -301,21 +331,21 @@ impl RedisBackend for LiveRedisBackend {
     }
 
     fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) {
-        if let Ok(mut con) = self.get_connection() {
+        if let Some(mut con) = self.try_get_connection() {
             let _: Result<(), _> = con.set_ex(key, value, ttl_secs);
         }
     }
 
     fn del(&self, keys: &[&str]) {
-        if let Ok(mut con) = self.get_connection() {
+        if let Some(mut con) = self.try_get_connection() {
             let _: Result<(), _> = redis::cmd("DEL").arg(keys).query(&mut con);
         }
     }
 
     fn incr_with_ttl(&self, key: &str, ttl_secs: u64) -> u64 {
-        let mut con = match self.get_connection() {
-            Ok(c) => c,
-            Err(_) => return 0,
+        let mut con = match self.try_get_connection() {
+            Some(c) => c,
+            None => return 0,
         };
         let count: u64 = redis::cmd("INCR").arg(key).query(&mut con).unwrap_or(0);
         if count == 1 {
@@ -325,7 +355,7 @@ impl RedisBackend for LiveRedisBackend {
     }
 
     fn get_u64(&self, key: &str) -> Option<u64> {
-        let mut con = self.get_connection().ok()?;
+        let mut con = self.try_get_connection()?;
         redis::cmd("GET").arg(key).query(&mut con).ok()
     }
 }
@@ -347,6 +377,8 @@ pub struct MockRedisBackend {
     store: Mutex<HashMap<String, MockEntry>>,
     /// Injected "current time" for deterministic tests.
     now_ms: Mutex<u64>,
+    /// When `true`, all operations simulate pool exhaustion.
+    pool_exhausted: std::sync::atomic::AtomicBool,
 }
 
 // --- Simple per-user quota store used by admin handlers in tests ---
@@ -383,6 +415,7 @@ impl MockRedisBackend {
         Self {
             store: Mutex::new(HashMap::new()),
             now_ms: Mutex::new(now_ms),
+            pool_exhausted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -394,6 +427,18 @@ impl MockRedisBackend {
     fn current_ms(&self) -> u64 {
         *self.now_ms.lock().unwrap()
     }
+
+    /// Simulate a Redis connection pool exhaustion for testing.
+    /// When `true`, all backend operations will behave as if the pool is exhausted.
+    pub fn set_pool_exhausted(&self, exhausted: bool) {
+        use std::sync::atomic::Ordering;
+        self.pool_exhausted.store(exhausted, Ordering::SeqCst);
+    }
+
+    fn is_pool_exhausted(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.pool_exhausted.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for MockRedisBackend {
@@ -404,6 +449,11 @@ impl Default for MockRedisBackend {
 
 impl RedisBackend for MockRedisBackend {
     fn ttl(&self, key: &str) -> i64 {
+        if self.is_pool_exhausted() {
+            tracing::warn!("MockRedisBackend: pool exhausted, failing open for ttl");
+            crate::metrics::record_redis_pool_exhaustion();
+            return -2;
+        }
         let now_ms = self.current_ms();
         let store = self.store.lock().unwrap();
         match store.get(key) {
@@ -429,6 +479,11 @@ impl RedisBackend for MockRedisBackend {
         member: &str,
         ttl_secs: u64,
     ) -> u64 {
+        if self.is_pool_exhausted() {
+            tracing::warn!("MockRedisBackend: pool exhausted, failing open for sliding_window_add");
+            crate::metrics::record_redis_pool_exhaustion();
+            return 0;
+        }
         let now_ms = self.current_ms();
         let mut store = self.store.lock().unwrap();
         let entry = store.entry(key.to_string()).or_insert(MockEntry {
@@ -749,8 +804,9 @@ impl RedisRateLimiter {
         window_secs: u64,
         lockout_secs: u64,
     ) -> Result<Self, redis::RedisError> {
-        let backend = LiveRedisBackend::new(redis_url)?;
         let cfg = EndpointConfig::new(window_secs, max_failures, lockout_secs);
+        let pool_timeout = std::time::Duration::from_millis(cfg.connection_timeout_ms);
+        let backend = LiveRedisBackend::new(redis_url)?.with_pool_timeout(pool_timeout);
         Ok(Self {
             inner: SlidingWindowRateLimiter::new(backend, cfg),
         })
@@ -990,5 +1046,56 @@ mod tenant_key_tests {
         // disable action should still be allowed
         let result_d = limiter.record_failure(disable_key.as_str());
         assert!(matches!(result_d, RateLimitResult::Allowed { .. }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for Redis pool exhaustion fail-open (Issue #796)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pool_exhaustion_tests {
+    use super::*;
+
+    /// When the mock backend signals pool exhaustion,
+    /// the sliding-window limiter must return Allowed (fail-open).
+    #[test]
+    fn test_mock_pool_exhaustion_returns_allowed() {
+        let backend = MockRedisBackend::new();
+        // Set up a limiter with a very low threshold so one hit would normally block.
+        let cfg = EndpointConfig::new(60, 1, 300);
+
+        // Activate pool exhaustion *before* handing the backend to the limiter
+        backend.set_pool_exhausted(true);
+
+        let limiter = SlidingWindowRateLimiter::new(backend, cfg);
+
+        // Even though max_failures=1, the pool exhaustion should cause fail-open
+        let result = limiter.record_failure("pool-exhausted-key");
+        assert!(
+            matches!(result, RateLimitResult::Allowed { .. }),
+            "Expected Allowed (fail-open) when pool is exhausted, got {:?}",
+            result
+        );
+    }
+
+    /// When pool exhaustion is *not* active, normal rate limiting still applies.
+    #[test]
+    fn test_mock_pool_exhaustion_disabled_blocks_normally() {
+        let backend = MockRedisBackend::new();
+        let cfg = EndpointConfig::new(60, 1, 300);
+        let limiter = SlidingWindowRateLimiter::new(backend, cfg);
+
+        // First hit: allowed (count goes to 1)
+        let r1 = limiter.record_failure("normal-key");
+        assert!(matches!(r1, RateLimitResult::Allowed { .. }));
+
+        // Second hit: blocked (max_failures=1, window breached)
+        let r2 = limiter.record_failure("normal-key");
+        assert!(
+            matches!(r2, RateLimitResult::Blocked { .. }),
+            "Expected Blocked when pool is healthy, got {:?}",
+            r2
+        );
     }
 }
